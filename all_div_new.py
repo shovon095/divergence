@@ -117,25 +117,20 @@ class DistillationArguments:
 # --------------------------
 def align_predictions(predictions, label_ids, valid_ids, label_map):
     preds = np.argmax(predictions, axis=2)
-    preds_list = []
-    out_label_list = []
-
+    preds_list, out_label_list = [], []
     for i in range(len(label_ids)):
         pred_tokens = []
         true_tokens = []
-        last_valid_pred = "O"  # default to 'O' explicitly
         for j in range(len(label_ids[i])):
-            if label_ids[i][j] == nn.CrossEntropyLoss().ignore_index:
+            if label_ids[i][j] == -100:
                 continue
             if valid_ids[i][j] == 1:
-                last_valid_pred = label_map[preds[i][j]]
-                pred_tokens.append(last_valid_pred)
+                pred_tokens.append(label_map[preds[i][j]])
                 true_tokens.append(label_map[label_ids[i][j]])
-            else:
-                pred_tokens.append(last_valid_pred)  # Always replicate last valid prediction
         preds_list.append(pred_tokens)
         out_label_list.append(true_tokens)
     return preds_list, out_label_list
+
 
 # --------------------------
 # SSJS Helper Functions
