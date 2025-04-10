@@ -237,8 +237,38 @@ def get_labels(path: Optional[str] = None) -> List[str]:
         "B-Undetermined", "I-Undetermined",
     ]
 
+# ============================================================
+# run_ner.py – Python 3.8‑compatible train / eval / predict
+# (uses utils_ner.py from the same project)
+# ============================================================
+
+import logging
+import os
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from seqeval.metrics import f1_score, precision_score, recall_score
+from transformers import (
+    AutoConfig,
+    AutoModelForTokenClassification,
+    AutoTokenizer,
+    EvalPrediction,
+    HfArgumentParser,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+)
+
+from utils_ner import NerDataset, Split, get_labels
+
+logger = logging.getLogger(__name__)
+
+IGNORE_INDEX = -100          # torch.nn.CrossEntropyLoss().ignore_index
+
 # ---------------------------------------------------------------------------
-# 2. The main script: train/eval/predict
+# dataclass argument groups
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -248,105 +278,109 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_dir: str = field(metadata={"help": "Folder with train_dev.txt/devel.txt/test.txt"})
+    data_dir: str = field(metadata={"help": "Dir with train_dev.txt / devel.txt / test.txt"})
     labels: Optional[str] = field(default=None)
     max_seq_length: int = field(default=128)
     overwrite_cache: bool = field(default=False)
 
+# ---------------------------------------------------------------------------
+# helper: align predictions to tokens
+# ---------------------------------------------------------------------------
+
 def align_predictions(
     predictions: np.ndarray,
     label_ids: np.ndarray,
-    valid_ids: np.ndarray,
     id2label: Dict[int, str],
 ) -> Tuple[List[List[str]], List[List[str]]]:
     """
-    Align predictions to tokens by ignoring subtoken positions (valid_ids=0).
+    Keep positions where label_ids != IGNORE_INDEX (‑100).
+    This automatically discards sub‑tokens and special tokens.
     """
     preds = predictions.argmax(-1)
     batch_preds: List[List[str]] = []
     batch_labels: List[List[str]] = []
 
-    for p_row, l_row, v_row in zip(preds, label_ids, valid_ids):
-        sent_preds: List[str] = []
-        sent_labels: List[str] = []
-        for p_val, l_val, v_val in zip(p_row, l_row, v_row):
-            if v_val == 1:
+    for p_row, l_row in zip(preds, label_ids):
+        sent_preds, sent_labels = [], []
+        for p_val, l_val in zip(p_row, l_row):
+            if l_val != IGNORE_INDEX:
                 sent_preds.append(id2label[int(p_val)])
                 sent_labels.append(id2label[int(l_val)])
         batch_preds.append(sent_preds)
         batch_labels.append(sent_labels)
     return batch_preds, batch_labels
 
-def build_compute_metrics(id2label: Dict[int, str]):
-    """
-    Returns a function that can be used as Trainer's compute_metrics argument.
-    """
-    def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
-        predictions = eval_pred.predictions
-        labels = eval_pred.label_ids
-        # 'valid_ids' come from the model input
-        valid_ids = eval_pred.inputs["valid_ids"]
+# ---------------------------------------------------------------------------
+# metrics builder for Trainer
+# ---------------------------------------------------------------------------
 
-        preds_list, labels_list = align_predictions(predictions, labels, valid_ids, id2label)
+def build_compute_metrics(id2label: Dict[int, str]):
+    def compute_metrics(eval_pred: EvalPrediction):  # type: ignore
+        preds_list, labels_list = align_predictions(
+            eval_pred.predictions,
+            eval_pred.label_ids,
+            id2label,
+        )
         return {
             "precision": precision_score(labels_list, preds_list),
             "recall": recall_score(labels_list, preds_list),
-            "f1": f1_score(labels_list, preds_list)
+            "f1": f1_score(labels_list, preds_list),
         }
     return compute_metrics
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    # Possibly parse json file
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Check for existing output dir
+    # safety: output dir
     if (
         os.path.isdir(training_args.output_dir)
         and os.listdir(training_args.output_dir)
         and training_args.do_train
         and not training_args.overwrite_output_dir
     ):
-        raise ValueError("Output directory already exists and is not empty. Use --overwrite_output_dir to proceed.")
+        raise ValueError("Output directory exists and is not empty — use --overwrite_output_dir to proceed.")
 
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         level=logging.INFO if training_args.local_rank in (-1, 0) else logging.WARN,
     )
-
-    logger.info("Training/evaluation parameters %s", training_args)
     set_seed(training_args.seed)
 
-    # 1) Load labels
+    # labels
     labels = get_labels(data_args.labels)
-    id2label = {i: label for i, label in enumerate(labels)}
-    label2id = {label: i for i, label in enumerate(labels)}
+    id2label = {i: l for i, l in enumerate(labels)}
+    label2id = {l: i for i, l in enumerate(labels)}
 
-    # 2) Load model config & tokenizer
+    # model & tokenizer
     config = AutoConfig.from_pretrained(
         model_args.model_name_or_path,
         num_labels=len(labels),
         id2label=id2label,
         label2id=label2id,
-        cache_dir=model_args.cache_dir
+        cache_dir=model_args.cache_dir,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         use_fast=True,
-        cache_dir=model_args.cache_dir
+        cache_dir=model_args.cache_dir,
     )
     model = AutoModelForTokenClassification.from_pretrained(
         model_args.model_name_or_path,
         config=config,
-        cache_dir=model_args.cache_dir
+        cache_dir=model_args.cache_dir,
     )
 
-    # 3) Prepare datasets
-    def maybe_load(split: Optional[Split]) -> Optional[NerDataset]:
+    # datasets
+    def load(split: Optional[Split]) -> Optional[NerDataset]:
         if split is None:
             return None
         return NerDataset(
@@ -355,68 +389,56 @@ def main() -> None:
             labels=labels,
             max_seq_length=data_args.max_seq_length,
             mode=split,
-            overwrite_cache=data_args.overwrite_cache
+            overwrite_cache=data_args.overwrite_cache,
         )
 
-    train_dataset = maybe_load(Split.train) if training_args.do_train else None
-    eval_dataset = maybe_load(Split.dev) if training_args.do_eval else None
-    test_dataset = maybe_load(Split.test) if training_args.do_predict else None
+    train_ds = load(Split.train) if training_args.do_train else None
+    dev_ds   = load(Split.dev)   if training_args.do_eval  else None
+    test_ds  = load(Split.test)  if training_args.do_predict else None
 
-    # 4) Setup Trainer
+    # trainer
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        train_dataset=train_ds,
+        eval_dataset=dev_ds,
         compute_metrics=build_compute_metrics(id2label),
     )
 
-    # 5) Train
+    # training
     if training_args.do_train:
         trainer.train()
-        # Save final
         trainer.save_model(training_args.output_dir)
         tokenizer.save_pretrained(training_args.output_dir)
 
-    # 6) Evaluate
-    if training_args.do_eval and eval_dataset is not None:
-        logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate()
-        logger.info("Eval results:")
-        for k, v in metrics.items():
-            logger.info("  %s = %s", k, v)
+    # evaluation
+    if training_args.do_eval and dev_ds is not None:
+        logger.info("*** Dev evaluation ***")
+        dev_metrics = trainer.evaluate()
+        for k, v in dev_metrics.items():
+            logger.info("%s = %.4f", k, v)
 
-    # 7) Predict
-    if training_args.do_predict and test_dataset is not None:
-        logger.info("*** Test ***")
-        preds, label_ids, metrics = trainer.predict(test_dataset)
-        logger.info("Test metrics:")
-        for k, v in metrics.items():
-            logger.info("  %s = %s", k, v)
+    # prediction
+    if training_args.do_predict and test_ds is not None:
+        logger.info("*** Test prediction ***")
+        preds, label_ids, test_metrics = trainer.predict(test_ds)
+        for k, v in test_metrics.items():
+            logger.info("%s = %.4f", k, v)
 
-        valid_ids = np.stack([f.valid_ids for f in test_dataset.features], axis=0)
-        preds_list, _ = align_predictions(preds, label_ids, valid_ids, id2label)
+        preds_list, _ = align_predictions(preds, label_ids, id2label)
 
-        # Write CoNLL-style predictions
-        output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
-        with open(output_test_predictions_file, "w", encoding="utf-8") as writer:
-            for example, pred_seq in zip(test_dataset.examples, preds_list):
-                # If there's a mismatch, handle carefully
-                if len(example.words) != len(pred_seq):
-                    logger.warning(
-                        "Mismatch between example %s (words=%d) and prediction (labels=%d). "
-                        "Truncation or subtoken mismatch may have occurred.",
-                        example.guid,
-                        len(example.words),
-                        len(pred_seq)
-                    )
-                for word, label in zip(example.words, pred_seq):
-                    writer.write(f"{word}\t{label}\n")
-                writer.write("\n")
-        logger.info("Wrote predictions to %s", output_test_predictions_file)
+        # write token<TAB>label with blank lines between sentences
+        out_file = os.path.join(training_args.output_dir, "test_predictions.txt")
+        with open(out_file, "w", encoding="utf-8") as w:
+            for ex, pred_seq in zip(test_ds.examples, preds_list):
+                for token, label in zip(ex.words, pred_seq):
+                    w.write(f"{token}\t{label}\n")
+                w.write("\n")
+        logger.info("Wrote predictions to %s", out_file)
 
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()
+
 
