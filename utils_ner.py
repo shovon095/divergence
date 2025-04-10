@@ -1,5 +1,5 @@
 # ============================================================
-# utils_ner.py – clean, modern Hugging Face NER utilities
+# utils_ner.py – clean, Python 3.8‑compatible Hugging Face NER utilities
 # ============================================================
 
 """Utility classes & functions for token‑classification datasets.
@@ -15,8 +15,6 @@ Key features
 * Dataset keeps a copy of the **examples** list so that the original
   tokens can be recovered later (e.g. when writing predictions).
 """
-
-from __future__ import annotations
 
 import logging
 import os
@@ -65,14 +63,15 @@ def read_examples_from_file(data_dir: str, mode: Union[Split, str]) -> List[Inpu
     """Read a CoNLL‑formatted file and return a list of InputExample."""
     if isinstance(mode, Split):
         mode = mode.value
-    file_path = os.path.join(data_dir, f"{mode}.tsv")
+    file_path = os.path.join(data_dir, f"{mode}.txt")
     logger.info("Reading %s data from %s", mode, file_path)
 
-    examples: list[InputExample] = []
-    words, labels = [], []
+    examples: List[InputExample] = []
+    words: List[str] = []
+    labels: List[str] = []
     guid = 1
 
-    with open(file_path, encoding="utf‑8") as f:
+    with open(file_path, encoding="utf-8") as f:
         for line in f:
             line = line.rstrip()
             if not line or line.startswith("-DOCSTART-"):
@@ -102,29 +101,28 @@ def convert_examples_to_features(
 ) -> List[InputFeatures]:
     """Turn InputExample objects into BERT‑style InputFeatures."""
     label_map = {l: i for i, l in enumerate(label_list)}
-    features: list[InputFeatures] = []
+    features: List[InputFeatures] = []
 
     cls_token, sep_token = tokenizer.cls_token, tokenizer.sep_token
     cls_token_segment_id = 0
 
     for ex_idx, example in enumerate(examples):
-        tokens, label_ids, valid_ids = [], [], []
+        tokens: List[str] = []
+        label_ids: List[int] = []
+        valid_ids: List[int] = []
 
         for word, label in zip(example.words, example.labels):
             word_tokens = tokenizer.tokenize(word) or [tokenizer.unk_token]
             tokens.extend(word_tokens)
-            # first sub‑token gets the real label, the rest get pad
             label_ids.extend([label_map[label]] + [pad_token_label_id] * (len(word_tokens) - 1))
             valid_ids.extend([1] + [0] * (len(word_tokens) - 1))
 
-        # Account for special tokens
         special = tokenizer.num_special_tokens_to_add()
         if len(tokens) > max_seq_length - special:
             tokens = tokens[: max_seq_length - special]
             label_ids = label_ids[: max_seq_length - special]
             valid_ids = valid_ids[: max_seq_length - special]
 
-        # Add [CLS] and [SEP]
         tokens = [cls_token] + tokens + [sep_token]
         label_ids = [pad_token_label_id] + label_ids + [pad_token_label_id]
         valid_ids = [0] + valid_ids + [0]
@@ -133,7 +131,6 @@ def convert_examples_to_features(
         attention_mask = [1] * len(input_ids)
         token_type_ids = [cls_token_segment_id] + [0] * (len(input_ids) - 1)
 
-        # Padding
         padding_len = max_seq_length - len(input_ids)
         input_ids += [tokenizer.pad_token_id] * padding_len
         attention_mask += [0] * padding_len
@@ -141,12 +138,10 @@ def convert_examples_to_features(
         label_ids += [pad_token_label_id] * padding_len
         valid_ids += [0] * padding_len
 
-        assert all(len(x) == max_seq_length for x in (input_ids, attention_mask, token_type_ids, label_ids, valid_ids))
+        assert len(input_ids) == max_seq_length
 
-        if ex_idx < 3:  # brief logging
-            logger.debug("*** Example %d ***", ex_idx)
+        if ex_idx < 3:
             logger.debug("tokens: %s", " ".join(tokens))
-            logger.debug("labels: %s", " ".join(map(str, label_ids)))
 
         features.append(InputFeatures(
             input_ids=input_ids,
@@ -196,8 +191,6 @@ class NerDataset(Dataset):
                 )
                 torch.save({"features": self.features, "examples": self.examples}, cache_path)
 
-    # Required dataset methods ------------------------------------------------
-
     def __len__(self) -> int:
         return len(self.features)
 
@@ -218,10 +211,9 @@ class NerDataset(Dataset):
 def get_labels(path: Optional[str] = None) -> List[str]:
     """Return the list of label strings, reading from *path* if given."""
     if path and os.path.isfile(path):
-        with open(path, encoding="utf‑8") as f:
+        with open(path, encoding="utf-8") as f:
             labels = [l.strip() for l in f if l.strip()]
         return ["O"] + [l for l in labels if l != "O"]
-    # Default label set for your disposition task
     return [
         "O",
         "B-Disposition", "I-Disposition",
