@@ -513,13 +513,22 @@ def main():
                 for key, value in metrics.items():
                     writer.write(f"{key} = {value}\n")
 
-            # Optionally align predictions and save them
+            # Align predictions to obtain a list of predicted label sequences
             preds_list, _ = align_predictions(predictions, label_ids, label_map)
-            output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
-            with open(output_test_predictions_file, "w") as writer:
-                # Example: each line is a list of predicted tags
-                for pred_seq in preds_list:
-                    writer.write(" ".join(pred_seq) + "\n")
+            
+            # Read raw test examples (in CoNLL format) using the utility function
+            raw_examples = read_examples_from_file(data_args.data_dir, Split.test)
+            
+            # Define the output file (e.g., test_predictions.tsv)
+            output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.tsv")
+            with open(output_test_predictions_file, "w", encoding="utf-8") as writer:
+                for ex, pred in zip(raw_examples, preds_list):
+                    # Write each token and its predicted label as tab-separated
+                    for token, pred_label in zip(ex.words, pred):
+                        writer.write(f"{token}\t{pred_label}\n")
+                    # Sentence boundary: add an empty line after each example
+                    writer.write("\n")
+            logger.info("Wrote predictions to %s", output_test_predictions_file)
 
 def _mp_fn(index):
     main()
