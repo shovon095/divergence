@@ -1,7 +1,11 @@
 #!/usr/bin/env python
-# llama_eval_interpret.py  (full version with --db_root support)
+# llama_interpret.py  —  evaluate a fine-tuned LLaMA Text-to-SQL model
+# with clause-level attention, Δ-logP attribution, schema-concept probes,
+# counter-factual SQL, and execution tests.
+# -------------------------------------------------------------
 
-import os, sqlite3, argparse, json, numpy as np, torch, torch.nn.functional as F
+import os, sqlite3, argparse, json, re, numpy as np
+import torch, torch.nn.functional as F
 import matplotlib.pyplot as plt, seaborn as sns
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.linear_model import LogisticRegression
@@ -21,195 +25,174 @@ def find_sqlite_file(root: str, db_id: str):
         if os.path.isfile(c2):
             return c2
     return None
-# -----------------------------------------------------------
 
-# ------- Utility Functions (unchanged) ---------------------
-
+# ────────── utilities ──────────
 def tag_sql_clauses(sql_str):
     tokens = sql_str.replace(",", " ,").split()
-    clause_tags = []
-    current_clause = None
+    clause_tags, cur = [], None
     for tok in tokens:
         up = tok.upper()
-        if up == "SELECT":
-            current_clause = "SELECT"
-        elif up == "FROM":
-            current_clause = "FROM"
-        elif up in ["WHERE", "HAVING"]:
-            current_clause = "WHERE"
-        elif "JOIN" in up:
-            current_clause = "JOIN"
-        elif up in ["GROUP", "ORDER"]:
-            current_clause = "GROUPBY" if up == "GROUP" else "ORDERBY"
-        clause_tags.append(current_clause if current_clause else "OTHER")
+        if up == "SELECT": cur = "SELECT"
+        elif up == "FROM": cur = "FROM"
+        elif up in ("WHERE", "HAVING"): cur = "WHERE"
+        elif "JOIN" in up: cur = "JOIN"
+        elif up in ("GROUP", "ORDER"): cur = "GROUPBY" if up == "GROUP" else "ORDERBY"
+        clause_tags.append(cur if cur else "OTHER")
     return tokens, clause_tags
 
-def plot_attention_heatmap(input_tokens, clause_names, attn_scores, out_path):
-    plt.figure(figsize=(len(input_tokens)*0.4+1, len(clause_names)*0.4+1))
-    sns.heatmap(attn_scores.T, xticklabels=input_tokens,
-                yticklabels=clause_names, cmap='Reds', cbar=True)
-    plt.xticks(rotation=90)
-    plt.yticks(rotation=0)
-    plt.xlabel("Input Tokens")
-    plt.ylabel("SQL Clause")
-    plt.tight_layout()
-    plt.savefig(out_path); plt.close()
+def plot_attention_heatmap(tokens, clauses, matrix, path):
+    plt.figure(figsize=(len(tokens)*0.4+1, len(clauses)*0.4+1))
+    sns.heatmap(matrix.T, xticklabels=tokens, yticklabels=clauses,
+                cmap="Reds", cbar=True)
+    plt.xticks(rotation=90); plt.yticks(rotation=0)
+    plt.xlabel("Input tokens"); plt.ylabel("SQL clause")
+    plt.tight_layout(h_pad=0.2); plt.savefig(path); plt.close()
 
-# ---------------- Main pipeline ----------------------------
-
-def main(args):
+# ────────── main ──────────
+def main(a):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model_path).to(device).eval()
+    tok = AutoTokenizer.from_pretrained(a.model_path, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+                a.model_path,
+                attn_implementation="eager"   # silence Sdpa warning
+            ).to(device).eval()
 
-    for subdir in ["preds", "viz", "probe"]:
-        os.makedirs(subdir, exist_ok=True)
+    for d in ("preds","viz","probe"): os.makedirs(d, exist_ok=True)
 
-    # Load evaluation examples
-    examples = [json.loads(l) for l in open(args.data_file)]
+    # --- load examples (JSONL or array) ---
+    with open(a.data_file) as f:
+        first = f.readline().lstrip(); f.seek(0)
+        if first.startswith("{"):
+            examples = [json.loads(l) for l in f if l.strip()]
+        else:
+            obj = json.load(f)
+            examples = obj["data"] if isinstance(obj, dict) and "data" in obj else obj
+    if a.limit > 0:
+        examples = examples[: a.limit]
     print(f"Loaded {len(examples)} examples.")
 
-    # Accumulators for concept probing
-    concept_features = {"table": [], "column": []}
-    concept_labels   = {"table": [], "column": []}
+    features, labels = {"table":[], "column":[]}, {"table":[], "column":[]}
 
-    for ex in examples:
-        ex_id   = ex.get("id", ex.get("example_id", "0"))
-        db_id   = ex.get("db_id", ex_id)          # NEW: for db_root lookup
-        question= ex["question"]
-        schema  = ex.get("schema", "")
-        db_path = ex.get("db_path")
+    for idx, ex in enumerate(examples):
+        ex_id = ex.get("id") or ex.get("example_id") \
+                or ex.get("question_id") or ex.get("db_id") or str(idx)
+        db_id = ex.get("db_id", ex_id)
+        q     = ex["question"]
+        schema= ex.get("schema", "")
+        db_path = ex.get("db_path") or (find_sqlite_file(a.db_root, db_id) if a.db_root else None)
 
-        # NEW: derive db_path if missing
-        if not db_path and args.db_root:
-            db_path = find_sqlite_file(args.db_root, db_id)
+        # prompt
+        prompt = f"-- Question: {q}\n-- Schema: {schema}\nSELECT"
+        inp    = tok(prompt, return_tensors="pt").to(device)
 
-        # Prepare prompt
-        prompt = f"-- SQL Generation. Question: {question}\n-- Schema: {schema}\nSELECT"
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-        # Generate SQL
+        # generate SQL
         with torch.no_grad():
-            generation_output = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-                output_attentions=True,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-        gen_tokens = generation_output.sequences[0]
-        pred_sql = tokenizer.decode(gen_tokens, skip_special_tokens=True)[len(prompt):].strip()
+            gen = model.generate(**inp,
+                                 max_new_tokens=a.max_new_tokens,
+                                 output_attentions=True,
+                                 output_hidden_states=True,
+                                 return_dict_in_generate=True)
+        sql_pred = tok.decode(gen.sequences[0], skip_special_tokens=True)[len(prompt):].strip()
+        open(f"preds/{ex_id}_pred.sql","w").write(sql_pred)
 
-        with open(os.path.join("preds", f"{ex_id}_pred.sql"), "w") as f:
-            f.write(pred_sql)
-
-        # Clause tagging & attention flow
-        sql_tokens, clause_tags = tag_sql_clauses(pred_sql)
-        clause_names = sorted(set(ct for ct in clause_tags if ct))
-
-        full_input = prompt + " " + pred_sql
-        full_ids = tokenizer(full_input, return_tensors="pt").input_ids.to(device)
+        # forward pass on full sequence for attention+hidden
+        full_ids = tok(prompt+" "+sql_pred, return_tensors="pt").input_ids.to(device)
         with torch.no_grad():
-            outputs = model(full_ids, output_attentions=True)
-        attn_tensor = torch.stack([a[0] for a in outputs.attentions])  # (L,H,S,S)
-        seq_len = full_ids.size(1); input_len = inputs.input_ids.size(1); output_len = seq_len - input_len
+            out = model(full_ids,
+                        output_attentions=True,
+                        output_hidden_states=True)
+        attn = torch.stack([a[0] for a in out.attentions])     # (L,H,S,S)
+        hidden = out.hidden_states                             # list(L+1) of (1,S,D)
 
-        attn_scores = np.zeros((input_len, len(clause_names)))
-        clause_to_idx = {c:i for i,c in enumerate(clause_names)}
-        L, H = attn_tensor.shape[:2]
+        S = full_ids.size(1); P = inp.input_ids.size(1); T = S-P
+        sql_tokens, clause_tags = tag_sql_clauses(sql_pred)
+        clause_names = sorted({c for c in clause_tags if c})
+
+        # clause-level attention heat-map
+        heat = np.zeros((P, len(clause_names))); c2i = {c:i for i,c in enumerate(clause_names)}
+        L,H = attn.shape[:2]
         for l in range(L):
             for h in range(H):
-                mat = attn_tensor[l,h].cpu().numpy()
-                for o in range(output_len):
-                    clause = clause_tags[o]
-                    if clause in clause_to_idx:
-                        idx = clause_to_idx[clause]
-                        attn_scores[:, idx] += mat[:input_len, input_len + o]
-        attn_scores /= (L * H)
+                M = attn[l,h].cpu().numpy()
+                for o, clause in enumerate(clause_tags):
+                    if o >= T or clause not in c2i: continue
+                    heat[:, c2i[clause]] += M[:P, P+o]
+        heat /= (L*H)
+        plot_attention_heatmap(tok.convert_ids_to_tokens(full_ids[0])[:P],
+                               clause_names, heat,
+                               f"viz/{ex_id}_attention_heatmap.png")
 
-        input_tok_str = tokenizer.convert_ids_to_tokens(full_ids[0])[:input_len]
-        plot_attention_heatmap(input_tok_str, clause_names, attn_scores,
-                               os.path.join("viz", f"{ex_id}_attention_heatmap.png"))
-
-        # Schema-Concept probe feature collection
-        tbls = re.findall(r"CREATE TABLE (\\w+)", schema, re.I)
-        col_names = []
-        for cols in re.findall(r"\\(([^)]+)\\)", schema):
-            col_names += [c.strip() for c in cols.split(",")]
-        layer_idx = args.probe_layer if args.probe_layer < len(generation_output.hidden_states) else -1
-        layer_states = generation_output.hidden_states[layer_idx][0].cpu().numpy()  # (seq, dim)
+        # schema-concept probe feats
+        tbls = re.findall(r"CREATE TABLE (\w+)", schema, re.I)
+        cols = [c.strip() for grp in re.findall(r"\(([^)]+)\)", schema) for c in grp.split(",")]
+        layer_idx = a.probe_layer if a.probe_layer < len(hidden) else -1
+        hid_vecs  = hidden[layer_idx][0].cpu().numpy()          # (S,D)
         for pos, tok_str in enumerate(sql_tokens):
-            vec = layer_states[input_len + pos]
-            concept_features["table"].append(vec)
-            concept_labels["table"].append(int(tok_str in tbls))
-            concept_features["column"].append(vec)
-            concept_labels["column"].append(int(tok_str in col_names))
+            if P+pos >= hid_vecs.shape[0]: break
+            v = hid_vecs[P+pos]
+            features["table"].append(v);  labels["table"].append(int(tok_str in tbls))
+            features["column"].append(v); labels["column"].append(int(tok_str in cols))
 
-        # Counter-factual prompt
-        cf_q, cf_s = question, schema
-        for k,v in args.cf_map.items():
-            cf_q = cf_q.replace(k, v); cf_s = cf_s.replace(k, v)
-        if cf_q != question or cf_s != schema:
-            cf_prompt = f"-- SQL Generation (counterfactual). Question: {cf_q}\n-- Schema: {cf_s}\nSELECT"
-            with torch.no_grad():
-                cf_out = model.generate(tokenizer(cf_prompt, return_tensors="pt").to(device),
-                                        max_new_tokens=args.max_new_tokens)
-            cf_sql = tokenizer.decode(cf_out[0], skip_special_tokens=True)[len(cf_prompt):].strip()
-            with open(os.path.join("preds", f"{ex_id}_cf_pred.sql"), "w") as f:
-                f.write(cf_sql)
+        # counter-factual SQL (optional)
+        cf_q, cf_schema = q, schema
+        for k,v in a.cf_map.items():
+            cf_q = cf_q.replace(k,v); cf_schema = cf_schema.replace(k,v)
+        if cf_q != q or cf_schema != schema:
+            cf_prompt = f"-- Question: {cf_q}\n-- Schema: {cf_schema}\nSELECT"
+            cf_ids = tok(cf_prompt, return_tensors="pt").to(device)
+            cf_sql = tok.decode(model.generate(**cf_ids, max_new_tokens=a.max_new_tokens)[0],
+                                skip_special_tokens=True)[len(cf_prompt):].strip()
+            open(f"preds/{ex_id}_cf_pred.sql","w").write(cf_sql)
 
-        # Execution check
-        exec_flag = False
-        if db_path and os.path.exists(db_path):
-            try:
-                sqlite3.connect(db_path).execute(pred_sql)
-                exec_flag = True
-            except Exception:
-                exec_flag = False
-        with open(os.path.join("preds", f"{ex_id}_exec.txt"), "w") as f:
-            f.write(f"Executable: {exec_flag}\n")
+        # execution test
+        exec_ok = False
+        if db_path and os.path.isfile(db_path):
+            try: sqlite3.connect(db_path).execute(sql_pred); exec_ok=True
+            except Exception: exec_ok=False
+        open(f"preds/{ex_id}_exec.txt","w").write(f"Executable: {exec_ok}\n")
 
-        # Δ-logP attribution
-        target_ids = tokenizer(pred_sql, return_tensors="pt").input_ids.to(device)
+        # Δ-logP attribution for prompt tokens
+        tgt_ids  = tok(sql_pred, return_tensors="pt").input_ids.to(device)
+        full_ids = torch.cat([inp.input_ids, tgt_ids], dim=1)
+        labels   = full_ids.clone(); labels[:, :P] = -100
         with torch.no_grad():
-            lp_full = model(input_ids=inputs.input_ids, labels=target_ids).loss.item() * target_ids.size(1)
-        deltas = []
-        for j in range(input_len):
-            masked = torch.cat([inputs.input_ids[:,:j], inputs.input_ids[:,j+1:]], 1)
+            base_lp = model(input_ids=full_ids, labels=labels).loss.item()*tgt_ids.size(1)
+        deltas=[]
+        for j in range(P):
+            masked = full_ids.clone(); masked[0,j] = tok.pad_token_id
             with torch.no_grad():
-                lp = model(input_ids=masked, labels=target_ids).loss.item() * target_ids.size(1)
-            deltas.append(lp_full - lp)
-        plt.figure(figsize=(input_len*0.3+1,2.5))
-        sns.barplot(x=input_tok_str, y=deltas, color="skyblue")
-        plt.xticks(rotation=90); plt.ylabel("Δ log-prob"); plt.tight_layout()
-        plt.savefig(os.path.join("viz", f"{ex_id}_attr.png")); plt.close()
+                lp = model(input_ids=masked, labels=labels).loss.item()*tgt_ids.size(1)
+            deltas.append(base_lp - lp)
+        plt.figure(figsize=(P*0.3+1,2.5))
+        sns.barplot(x=tok.convert_ids_to_tokens(full_ids[0])[:P], y=deltas, color="skyblue")
+        plt.xticks(rotation=90); plt.ylabel("Δ log-prob"); plt.tight_layout(h_pad=0.2)
+        plt.savefig(f"viz/{ex_id}_attr.png"); plt.close()
 
-        print(f"Processed {ex_id}: exec={exec_flag}")
+        print(f"Processed {ex_id}: exec={exec_ok}")
 
-    # Train concept probes
-    for concept in ("table", "column"):
-        X = np.stack(concept_features[concept]); y = np.array(concept_labels[concept])
-        if len(np.unique(y)) < 2:
-            with open(os.path.join("probe", f"{concept}_probe.txt"), "w") as f:
-                f.write("Not enough positive/negative examples.\n")
+    # train simple logistic probes
+    for c in ("table","column"):
+        X=np.stack(features[c]); y=np.array(labels[c])
+        if len(np.unique(y))<2:
+            open(f"probe/{c}_probe.txt","w").write("Not enough positive/negative examples\n")
             continue
-        clf = LogisticRegression(max_iter=1000).fit(X, y)
-        acc = clf.score(X, y)
-        with open(os.path.join("probe", f"{concept}_probe.txt"), "w") as f:
-            f.write(f"Accuracy: {acc:.3f}\nNorm‖w‖: {np.linalg.norm(clf.coef_):.3f}\n")
+        clf=LogisticRegression(max_iter=1000).fit(X,y)
+        acc=clf.score(X,y)
+        open(f"probe/{c}_probe.txt","w").write(f"Accuracy: {acc:.3f}\n‖w‖: {np.linalg.norm(clf.coef_):.3f}\n")
 
-    print("Interpretability evaluation completed.")
+    print("✓ interpretability evaluation completed")
 
-# ---------------- CLI -----------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", required=True, help="Path to fine-tuned LLaMA model")
-    parser.add_argument("--data_file", required=True, help="JSONL file of dev examples")
-    parser.add_argument("--db_root", default="", help="Root folder containing <db_id>/<db_id>.sqlite")
-    parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--probe_layer", type=int, default=-1)
-    parser.add_argument("--cf_map", type=json.loads, default="{}",
-                        help='JSON string mapping originals→replacements for counter-factual (e.g. \'{"orders":"purchases"}\')')
-    args = parser.parse_args()
+# ───────── CLI ─────────
+if __name__=="__main__":
+    p=argparse.ArgumentParser()
+    p.add_argument("--model_path", required=True)
+    p.add_argument("--data_file", required=True)
+    p.add_argument("--db_root", default="")
+    p.add_argument("--max_new_tokens", type=int, default=128)
+    p.add_argument("--probe_layer", type=int, default=-1)
+    p.add_argument("--limit", type=int, default=-1,
+                   help="Process only first N examples (-1 = all)")
+    p.add_argument("--cf_map", type=json.loads, default="{}",
+                   help='JSON str for counter-factual replacements, e.g. \'{"orders":"purchases"}\'')
+    args=p.parse_args()
     main(args)
